@@ -105,7 +105,6 @@ ipython_config.py
 *.jpeg
 *.gif
 *.svg
-*.pdf
 
 # Generated benchmark results
 benchmark_*.png
