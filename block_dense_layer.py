@@ -6,19 +6,17 @@ import numpy as np
 
 class BlockDense(layers.Layer):
     """
-    A custom Keras layer that implements a block-diagonal Dense transform.
+    A custom Keras layer that implements completely independent SKU processing.
     
-    This layer maintains G independent "mini-trunks" of size (w → H) that are
-    fused into one large matrix multiplication with a block-diagonal constraint.
-    Each input block [i*w:(i+1)*w] only connects to its own output block [i*H:(i+1)*H].
+    This layer maintains G completely independent "mini-trunks" with NO weight sharing.
+    Each SKU has its own separate weight matrix and processes its data independently.
     
     Attributes:
-        group_size (int): Number of independent blocks G
-        window_size (int): Input width per block w
-        hidden_units (int): Output width per block H
+        group_size (int): Number of independent SKUs G
+        window_size (int): Input width per SKU w
+        hidden_units (int): Output width per SKU H
         activation (str|None): Activation function to apply after matrix multiplication
-        W (tf.Variable): Weight matrix of shape (window_size*group_size, hidden_units*group_size)
-        mask (tf.Tensor): Block-diagonal mask to enforce connectivity constraints
+        sku_weights (list): List of independent weight matrices for each SKU
     """
     
     def __init__(self, group_size, window_size, hidden_units, activation=None, **kwargs):
@@ -26,9 +24,9 @@ class BlockDense(layers.Layer):
         Initialize the BlockDense layer.
         
         Args:
-            group_size (int): Number of independent blocks G
-            window_size (int): Input width per block w
-            hidden_units (int): Output width per block H
+            group_size (int): Number of independent SKUs G
+            window_size (int): Input width per SKU w
+            hidden_units (int): Output width per SKU H
             activation (str|None): Activation function name (e.g., 'relu', 'tanh', None)
             **kwargs: Additional arguments passed to the parent Layer class
         """
@@ -49,7 +47,7 @@ class BlockDense(layers.Layer):
     
     def build(self, input_shape):
         """
-        Build the layer by creating the weight matrix and block-diagonal mask.
+        Build the layer by creating separate weight matrices for each SKU.
         
         Args:
             input_shape: Expected input shape (batch_size, window_size * group_size)
@@ -62,33 +60,16 @@ class BlockDense(layers.Layer):
         if input_shape[-1] != expected_input_dim:
             raise ValueError(f"Expected input dimension {expected_input_dim}, got {input_shape[-1]}")
         
-        # Create weight matrix with Xavier/Glorot initialization
-        output_dim = self.hidden_units * self.group_size
-        self.W = self.add_weight(
-            name='block_dense_weights',
-            shape=(expected_input_dim, output_dim),
-            initializer=keras.initializers.GlorotUniform(),
-            trainable=True
-        )
-        
-        # Create block-diagonal mask
-        # The mask ensures that each input block only connects to its corresponding output block
-        mask = np.zeros((expected_input_dim, output_dim), dtype=np.float32)
-        
+        # Create separate weight matrices for each SKU
+        self.sku_weights = []
         for i in range(self.group_size):
-            # Input block indices: [i*window_size:(i+1)*window_size]
-            input_start = i * self.window_size
-            input_end = (i + 1) * self.window_size
-            
-            # Output block indices: [i*hidden_units:(i+1)*hidden_units]
-            output_start = i * self.hidden_units
-            output_end = (i + 1) * self.hidden_units
-            
-            # Set the block to 1 (allow connections within this block)
-            mask[input_start:input_end, output_start:output_end] = 1.0
-        
-        # Store mask as a non-trainable constant
-        self.mask = tf.constant(mask, dtype=tf.float32, name='block_diagonal_mask')
+            weight = self.add_weight(
+                name=f'sku_{i}_weights',
+                shape=(self.window_size, self.hidden_units),
+                initializer=keras.initializers.GlorotUniform(),
+                trainable=True
+            )
+            self.sku_weights.append(weight)
         
         # Set the activation function
         if self.activation is not None:
@@ -107,20 +88,26 @@ class BlockDense(layers.Layer):
         Returns:
             Output tensor of shape (batch_size, hidden_units * group_size)
         """
-        # Apply block-diagonal mask to weights
-        # This ensures that each input block only connects to its corresponding output block
-        W_masked = self.W * self.mask
+        outputs = []
         
-        # Perform matrix multiplication: inputs @ W_masked
-        # Shape: (batch_size, window_size * group_size) @ (window_size * group_size, hidden_units * group_size)
-        # Result: (batch_size, hidden_units * group_size)
-        output = tf.matmul(inputs, W_masked)
+        # Process each SKU independently
+        for i in range(self.group_size):
+            # Extract input slice for this SKU
+            start_idx = i * self.window_size
+            end_idx = (i + 1) * self.window_size
+            sku_input = inputs[:, start_idx:end_idx]
+            
+            # Apply this SKU's independent weight matrix
+            sku_output = tf.matmul(sku_input, self.sku_weights[i])
+            
+            # Apply activation function if specified
+            if self.activation_fn is not None:
+                sku_output = self.activation_fn(sku_output)
+            
+            outputs.append(sku_output)
         
-        # Apply activation function if specified
-        if self.activation_fn is not None:
-            output = self.activation_fn(output)
-        
-        return output
+        # Concatenate all SKU outputs
+        return tf.concat(outputs, axis=1)
     
     def get_config(self):
         """
